@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+venv/
+.env
+
+# Generated data and model artifacts
+artifacts/
+data/
+
+# Keep lightweight project documentation
+!data/
+data/*
+!data/README.md

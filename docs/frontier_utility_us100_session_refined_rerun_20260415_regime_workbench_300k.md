@@ -1,6 +1,6 @@
 # Current Baseline Report
 
-Generated at `2026-04-20T06:28:10.960507+00:00` from `frontier_utility/us100_session_refined_rerun_20260415_regime_workbench_300k`.
+Generated at `2026-04-20T15:49:58.639484+00:00` from `frontier_utility/us100_session_refined_rerun_20260415_regime_workbench_300k`.
 
 ## Baseline Snapshot
 
@@ -16,57 +16,57 @@ Generated at `2026-04-20T06:28:10.960507+00:00` from `frontier_utility/us100_ses
 ## Training Snapshot
 
 - Lookback: `96` bars
-- Feature count: `70`
+- Feature count: `74`
 - Train / val split: `70%` / `15%`
-- Epochs: `4`
-- Batch size: `64`
+- Epochs: `6`
+- Batch size: `256`
 - Negative ratio: `0.0`
-- Channels: `32, 32, 48`
-- Hidden dim: `64`
+- Channels: `64, 64, 96`
+- Hidden dim: `128`
 - Dropout: `0.15`
 
 ## Backtest Summary
 
-- Trades: `100`
-- Active trading days: `34`
+- Trades: `66`
+- Active trading days: `33`
 - First trade date: `2020-10-23`
 - Last trade date: `2020-12-11`
 - Calendar span covered by active trades: `50` days
-- Win rate: `0.26000`
+- Win rate: `0.31818`
 - Loss rate: `0.00000`
-- Expectancy: `0.369627R` per trade
-- Average R per trade: `0.369627R`
-- Total R: `36.96R`
+- Expectancy: `0.463918R` per trade
+- Average R per trade: `0.463918R`
+- Total R: `30.62R`
 - Profit factor: `0.000000`
-- Average win: `1.421644R`
+- Average win: `1.458030R`
 - Average loss: `n/a`
 - Realized payoff ratio: `n/a`
 - Average hold time: `1.000000` bars
-- Ending balance: `$109,662.94`
-- Return: `9.6629%`
-- Max drawdown: `0.7993%`
+- Ending balance: `$117,015.03`
+- Return: `17.0150%`
+- Max drawdown: `1.1942%`
 - Drawdown peak date: `None`
 - Drawdown trough date: `None`
-- Best trade: `2020-11-09` | `long_reversal` | `$416.74` | `1.62R` | `utility_label`
+- Best trade: `2020-11-06` | `long_reversal` | `$1,272.76` | `1.50R` | `utility_label`
 - Worst trade: `2020-10-23` | `long_reversal` | `$0.00` | `0.00R` | `utility_label`
 
 ## Distribution
 
 - Median trade: `0.0`R
-- Trade R std dev: `0.631345`
-- Mean daily return: `0.272057`%
-- Daily return std dev: `0.284527`%
-- Daily Sharpe proxy: `0.9562`
+- Trade R std dev: `0.686175`
+- Mean daily return: `0.478743`%
+- Daily return std dev: `0.549009`%
+- Daily Sharpe proxy: `0.872`
 - Daily Sortino proxy: `None`
 
 ## Acceptance Metrics
 
-- Pass probability 30 / 60 / 90: `0.158` / `1.0` / `1.0`
-- Median / avg days to pass: `None` / `None`
-- Profitable-day hit rate day 10 / 20: `0.911765` / `0.911765`
+- Pass probability 30 / 60 / 90: `0.938` / `1.0` / `1.0`
+- Median / avg days to pass: `11.0` / `15.888889`
+- Profitable-day hit rate day 10 / 20: `0.848485` / `0.909091`
 - Longest trade loss streak: `0`
 - Longest negative day streak: `0`
-- Worst month return %: `1.859173`
+- Worst month return %: `2.670171`
 - Loss cluster penalty: `0.0`
 
 ## Prop-Firm Metrics
@@ -78,97 +78,97 @@ Generated at `2026-04-20T06:28:10.960507+00:00` from `frontier_utility/us100_ses
 - Max daily loss: `5.00%`
 - Hard max loss per trade: `3.00%`
 - Configured base risk per trade: `0.25%`
-- Actual test path passed: `False`
-- Days to pass on the recorded test path: `None` active trading days
-- Profitable days on the recorded test path: `20`
-- Historical rolling-start pass rate: `0.000000` (0/34)
-- Fastest historical rolling-start pass: `None` active trading days
-- Average historical rolling-start pass: `None` active trading days
-- Median historical rolling-start pass: `None` active trading days
+- Actual test path passed: `True`
+- Days to pass on the recorded test path: `12` active trading days
+- Profitable days on the recorded test path: `8`
+- Historical rolling-start pass rate: `0.272727` (9/33)
+- Fastest historical rolling-start pass: `10` active trading days
+- Average historical rolling-start pass: `15.44` active trading days
+- Median historical rolling-start pass: `12` active trading days
 - Bootstrap pass probabilities from active-day return resampling:
-  - `30`-day horizon: pass probability `0.177500`, average pass day `27.52`, median pass day `28`, min pass day `17`
-  - `60`-day horizon: pass probability `0.999500`, average pass day `36.12`, median pass day `36`, min pass day `20`
-  - `66`-day horizon: pass probability `1.000000`, average pass day `35.92`, median pass day `36`, min pass day `18`
-  - `90`-day horizon: pass probability `1.000000`, average pass day `36.21`, median pass day `36`, min pass day `17`
-  - `120`-day horizon: pass probability `1.000000`, average pass day `36.07`, median pass day `36`, min pass day `18`
+  - `30`-day horizon: pass probability `0.955000`, average pass day `20.52`, median pass day `20`, min pass day `8`
+  - `60`-day horizon: pass probability `1.000000`, average pass day `21.18`, median pass day `21`, min pass day `8`
+  - `66`-day horizon: pass probability `1.000000`, average pass day `21.13`, median pass day `21`, min pass day `9`
+  - `90`-day horizon: pass probability `1.000000`, average pass day `21.27`, median pass day `21`, min pass day `9`
+  - `120`-day horizon: pass probability `1.000000`, average pass day `21.29`, median pass day `21`, min pass day `8`
 
 ## Daily Consistency
 
-- Profitable days: `21`
+- Profitable days: `17`
 - Losing days: `0`
-- Positive day rate: `0.617647`
-- Average daily return: `0.272057%`
-- Median daily return: `0.341835%`
-- Best day: `2020-11-09` | `$826.29` | `3.22R` | `-0.3978%` | `3` trades
-- Worst day: `2020-10-26` | `$0.00` | `0.00R` | `0.0000%` | `3` trades
+- Positive day rate: `0.515152`
+- Average daily return: `0.478743%`
+- Median daily return: `0.449484%`
+- Best day: `2020-11-06` | `$2,525.32` | `2.98R` | `0.0000%` | `2` trades
+- Worst day: `2020-10-23` | `$0.00` | `0.00R` | `0.0000%` | `2` trades
 
 ## Streaks
 
-- Longest win streak: `2` trades
+- Longest win streak: `3` trades
 - Longest loss streak: `0` trades
-- Longest positive-day streak: `5` days
+- Longest positive-day streak: `6` days
 - Longest negative-day streak: `0` days
 
 ## Start Timing
 
-- After `flat_or_unknown` streak `0`: `26` starts, pass rate `0.000000`, average days to pass `None`, median days to pass `None`
-- After `win` streak `1`: `5` starts, pass rate `0.000000`, average days to pass `None`, median days to pass `None`
-- After `win` streak `2`: `3` starts, pass rate `0.000000`, average days to pass `None`, median days to pass `None`
+- After `win` streak `2`: `3` starts, pass rate `0.333333`, average days to pass `15.0`, median days to pass `15.0`
+- After `flat_or_unknown` streak `0`: `23` starts, pass rate `0.304348`, average days to pass `14.1428571429`, median days to pass `12.0`
+- After `win` streak `1`: `7` starts, pass rate `0.142857`, average days to pass `25.0`, median days to pass `25.0`
 
 ## Operating Profile
 
-- Average trades per day: `2.941176`
-- Median trades per day: `3.000000`
-- Days at max-trade cap: `33` / `34`
-- Capacity utilization on active days: `98.0392%`
-- Skip counts: `cooldown=0`, `ineligible=0`, `session_end_buffer=0`, `daily_trade_cap=0`, `allocator_low_utility=34870`
+- Average trades per day: `2.000000`
+- Median trades per day: `2.000000`
+- Days at max-trade cap: `33` / `33`
+- Capacity utilization on active days: `100.0000%`
+- Skip counts: `cooldown=0`, `ineligible=0`, `session_end_buffer=0`, `daily_trade_cap=0`, `allocator_low_utility=26131`
 
 ## Breakdown By Setup
 
-- `short_continuation`: trades `43`, win rate `0.325581`, expectancy `0.461176R`, total `19.830585R`, PnL `$5,131.34`
-- `long_reversal`: trades `43`, win rate `0.232558`, expectancy `0.332742R`, total `14.307918R`, PnL `$3,800.45`
-- `long_continuation`: trades `8`, win rate `0.250000`, expectancy `0.353031R`, total `2.824245R`, PnL `$731.16`
-- `short_reversal`: trades `6`, win rate `0.000000`, expectancy `0.000000R`, total `0.000000R`, PnL `$0.00`
+- `long_reversal`: trades `32`, win rate `0.343750`, expectancy `0.509416R`, total `16.301312R`, PnL `$9,195.95`
+- `short_continuation`: trades `29`, win rate `0.310345`, expectancy `0.441510R`, total `12.803797R`, PnL `$6,740.93`
+- `long_continuation`: trades `3`, win rate `0.333333`, expectancy `0.504504R`, total `1.513511R`, PnL `$1,078.16`
+- `short_reversal`: trades `2`, win rate `0.000000`, expectancy `0.000000R`, total `0.000000R`, PnL `$0.00`
 
 ## Breakdown By Market Session
 
-- `europe`: trades `32`, win rate `0.375000`, expectancy `0.524456R`, total `16.782608R`
-- `us`: trades `48`, win rate `0.229167`, expectancy `0.340705R`, total `16.353852R`
-- `asia`: trades `20`, win rate `0.150000`, expectancy `0.191314R`, total `3.826288R`
+- `europe`: trades `22`, win rate `0.409091`, expectancy `0.593020R`, total `13.046444R`
+- `us`: trades `36`, win rate `0.222222`, expectancy `0.328778R`, total `11.835993R`
+- `asia`: trades `8`, win rate `0.500000`, expectancy `0.717023R`, total `5.736183R`
 
 ## Breakdown By Session Phase
 
-- `late_60_80`: trades `43`, win rate `0.348837`, expectancy `0.519283R`, total `22.329161R`
-- `mid_40_60`: trades `20`, win rate `0.350000`, expectancy `0.468147R`, total `9.362946R`
-- `opening_0_20`: trades `8`, win rate `0.250000`, expectancy `0.341925R`, total `2.735398R`
-- `close_80_100`: trades `16`, win rate `0.062500`, expectancy `0.090272R`, total `1.444353R`
-- `build_20_40`: trades `13`, win rate `0.076923`, expectancy `0.083915R`, total `1.090890R`
+- `late_60_80`: trades `31`, win rate `0.322581`, expectancy `0.481134R`, total `14.915158R`
+- `mid_40_60`: trades `15`, win rate `0.400000`, expectancy `0.569003R`, total `8.535051R`
+- `build_20_40`: trades `6`, win rate `0.333333`, expectancy `0.496686R`, total `2.980118R`
+- `opening_0_20`: trades `4`, win rate `0.500000`, expectancy `0.689016R`, total `2.756065R`
+- `close_80_100`: trades `10`, win rate `0.100000`, expectancy `0.143223R`, total `1.432228R`
 
 ## Best Days
 
-- `2020-11-09`: `$826.29` | `3.22R` | `-0.3978%` | `3` trades
-- `2020-11-30`: `$814.30` | `3.06R` | `0.3844%` | `3` trades
-- `2020-11-10`: `$801.99` | `3.10R` | `0.0000%` | `3` trades
-- `2020-10-23`: `$753.37` | `3.01R` | `0.3731%` | `3` trades
-- `2020-12-07`: `$640.10` | `2.37R` | `0.0000%` | `3` trades
-- `2020-11-16`: `$405.41` | `1.55R` | `0.3880%` | `3` trades
-- `2020-10-30`: `$398.38` | `1.57R` | `0.3926%` | `3` trades
-- `2020-11-04`: `$396.07` | `1.55R` | `0.0000%` | `3` trades
-- `2020-12-08`: `$393.00` | `1.45R` | `0.0000%` | `3` trades
-- `2020-11-23`: `$392.58` | `1.48R` | `0.0000%` | `3` trades
+- `2020-11-06`: `$2,525.32` | `2.98R` | `0.0000%` | `2` trades
+- `2020-10-29`: `$2,290.29` | `2.90R` | `0.0000%` | `2` trades
+- `2020-11-30`: `$1,286.85` | `3.08R` | `0.0000%` | `2` trades
+- `2020-10-30`: `$1,249.16` | `1.57R` | `0.0000%` | `2` trades
+- `2020-11-04`: `$1,183.79` | `1.59R` | `0.0000%` | `2` trades
+- `2020-12-11`: `$1,095.04` | `2.80R` | `0.9447%` | `2` trades
+- `2020-11-05`: `$1,083.33` | `1.44R` | `0.0000%` | `2` trades
+- `2020-11-03`: `$1,078.16` | `1.51R` | `1.0307%` | `2` trades
+- `2020-10-26`: `$1,060.74` | `1.35R` | `1.0607%` | `2` trades
+- `2020-11-09`: `$562.00` | `1.61R` | `0.0000%` | `2` trades
 
 ## Worst Days
 
-- `2020-11-11`: `$0.00` | `0.00R` | `0.0000%` | `3` trades
-- `2020-11-12`: `$0.00` | `0.00R` | `0.0000%` | `3` trades
-- `2020-11-25`: `$0.00` | `0.00R` | `0.0000%` | `3` trades
-- `2020-12-09`: `$0.00` | `0.00R` | `0.0000%` | `3` trades
-- `2020-11-20`: `$0.00` | `0.00R` | `0.0000%` | `3` trades
-- `2020-11-05`: `$0.00` | `0.00R` | `0.0000%` | `3` trades
-- `2020-12-04`: `$0.00` | `0.00R` | `0.0000%` | `1` trades
-- `2020-11-06`: `$0.00` | `0.00R` | `0.0000%` | `3` trades
-- `2020-11-02`: `$0.00` | `0.00R` | `0.0000%` | `3` trades
-- `2020-12-01`: `$0.00` | `0.00R` | `0.0000%` | `3` trades
+- `2020-10-23`: `$0.00` | `0.00R` | `0.0000%` | `2` trades
+- `2020-12-09`: `$0.00` | `0.00R` | `0.0000%` | `2` trades
+- `2020-12-02`: `$0.00` | `0.00R` | `0.0000%` | `2` trades
+- `2020-12-01`: `$0.00` | `0.00R` | `0.0000%` | `2` trades
+- `2020-11-25`: `$0.00` | `0.00R` | `0.0000%` | `2` trades
+- `2020-11-24`: `$0.00` | `0.00R` | `0.0000%` | `2` trades
+- `2020-11-23`: `$0.00` | `0.00R` | `0.0000%` | `2` trades
+- `2020-11-20`: `$0.00` | `0.00R` | `0.0000%` | `2` trades
+- `2020-11-18`: `$0.00` | `0.00R` | `0.0000%` | `2` trades
+- `2020-11-13`: `$0.00` | `0.00R` | `0.0000%` | `2` trades
 
 ## Sequence Diagnostics
 
@@ -178,8 +178,9 @@ Generated at `2026-04-20T06:28:10.960507+00:00` from `frontier_utility/us100_ses
 
 ### After Win Streaks
 
-- Prior `win` streak `1`: `20` samples, next-trade win probability `0.250000`, next-trade expectancy `0.363772R`, `next_5_trade_avg_r` `0.319492R`
-- Prior `win` streak `2`: `5` samples, next-trade win probability `0.000000`, next-trade expectancy `0.000000R`, `next_5_trade_avg_r` `0.229386R`
+- Prior `win` streak `1`: `13` samples, next-trade win probability `0.384615`, next-trade expectancy `0.561123R`, `next_5_trade_avg_r` `0.538129R`
+- Prior `win` streak `2`: `5` samples, next-trade win probability `0.600000`, next-trade expectancy `0.915936R`, `next_5_trade_avg_r` `0.708159R`
+- Prior `win` streak `3`: `2` samples, next-trade win probability `0.000000`, next-trade expectancy `0.000000R`, `next_5_trade_avg_r` `0.304689R`
 
 ## Notes
 

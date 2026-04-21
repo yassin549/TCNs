@@ -478,7 +478,7 @@ def parse_args() -> argparse.Namespace:
     build.add_argument("--label-report-output")
     build.add_argument("--max-rows", type=int, default=0)
     build.add_argument("--starting-balance", type=float, default=100000.0)
-    build.add_argument("--max-trades-per-day", type=int, default=3)
+    build.add_argument("--max-trades-per-day", type=int, default=2)
     build.add_argument("--risk-per-trade-pct", type=float, default=0.25)
     build.add_argument("--account-stage", choices=["challenge", "funded"], default="challenge")
     build.add_argument("--target-atr-multiple", type=float, default=1.25)

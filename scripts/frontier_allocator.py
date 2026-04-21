@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 @dataclass(frozen=True)
 class AllocationConfig:
     min_trade_score: float = 0.0
-    max_trades_per_day: int = 3
+    max_trades_per_day: int = 2
     max_setup_share: float = 0.67
     challenge_max_setup_share: float = 1.0
     allow_continuation: bool = False
@@ -46,11 +46,13 @@ class AllocationConfig:
     soft_defensive_score_bump: float = 0.05
     hard_defensive_score_bump: float = 0.12
     hard_defensive_disable_asia_build_20_40: bool = True
-    challenge_base_risk_pct: float = 0.35
-    challenge_max_risk_pct: float = 0.60
-    challenge_near_target_risk_pct: float = 0.20
+    challenge_min_risk_pct: float = 0.25
+    challenge_base_risk_pct: float = 0.50
+    challenge_max_risk_pct: float = 1.00
+    challenge_near_target_risk_pct: float = 0.35
+    funded_min_risk_pct: float = 0.10
     funded_base_risk_pct: float = 0.20
-    funded_max_risk_pct: float = 0.30
+    funded_max_risk_pct: float = 0.50
     funded_defensive_risk_pct: float = 0.10
 
 
@@ -102,6 +104,8 @@ def determine_kill_switch_state(account_state: Dict[str, float], config: Allocat
 
 
 def _base_candidate_score(candidate: Dict[str, object], config: AllocationConfig) -> float:
+    if "predicted_frontier_score" in candidate:
+        return float(candidate.get("predicted_frontier_score", 0.0))
     if "predicted_trade_utility" not in candidate:
         return float(candidate.get("predicted_frontier_score", 0.0))
     account_stage = str(candidate.get("account_stage", "challenge"))
@@ -249,6 +253,7 @@ def build_policy_payload(config: AllocationConfig) -> Dict[str, object]:
         "allocation_config": asdict(config),
         "notes": [
             "Daily trade selection is performed jointly across same-day candidates.",
+            "Selection uses the model's stage-aware frontier score directly when available so acceptance stays aligned with training-time ranking.",
             "Continuation experts stay disabled by default until they improve replay utility after slot competition.",
             "Allocator rank is stage-aware: challenge mode prioritizes fast pass or fast resolution, funded mode prioritizes return with breach control.",
             "Challenge mode is intentionally more aggressive and tolerates higher drawdown so long as hard prop-firm limits are respected.",

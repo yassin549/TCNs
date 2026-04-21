@@ -33,33 +33,58 @@ def _account_stage(account_state: Dict[str, object], account_config: AccountStat
     return "funded" if stage == "funded" else "challenge"
 
 
+def _sigmoid(value: float) -> float:
+    clipped = float(np.clip(value, -8.0, 8.0))
+    return float(1.0 / (1.0 + np.exp(-clipped)))
+
+
 def _stage_risk_pct(candidate: Dict[str, object], account_state: Dict[str, object], account_config: AccountStateConfig, allocation_config: AllocationConfig) -> float:
     stage = _account_stage(account_state, account_config)
     drawdown_pct = float(account_state.get("account_drawdown_pct", 0.0))
     distance_to_target = float(account_state.get("account_distance_to_target_pct", 0.0))
     daily_budget_remaining = float(account_state.get("day_loss_budget_remaining_pct", account_config.max_daily_loss_pct))
     total_budget_remaining = float(account_state.get("total_drawdown_budget_remaining_pct", account_config.max_total_drawdown_pct))
+    frontier_score = float(candidate.get("predicted_frontier_score", 0.0))
+    utility_edge = max(float(candidate.get("predicted_trade_utility", 0.0)), 0.0)
+    challenge_fail_risk = 0.5 * (
+        float(candidate.get("predicted_challenge_fail_prob_5d", 0.0))
+        + float(candidate.get("predicted_challenge_fail_prob_10d", 0.0))
+    )
+    funded_breach_risk = 0.5 * (
+        float(candidate.get("predicted_funded_breach_risk_5d", 0.0))
+        + float(candidate.get("predicted_funded_breach_risk_20d", 0.0))
+    )
+    edge_quality = _sigmoid(1.50 * frontier_score + 2.25 * utility_edge)
     if stage == "challenge":
-        risk_pct = allocation_config.challenge_base_risk_pct
+        risk_pct = allocation_config.challenge_min_risk_pct + (
+            allocation_config.challenge_max_risk_pct - allocation_config.challenge_min_risk_pct
+        ) * edge_quality
+        risk_pct *= max(0.60, 1.0 - 0.35 * float(np.clip(challenge_fail_risk, 0.0, 1.0)))
         if (
             distance_to_target >= 6.0
             and drawdown_pct <= 1.5
             and daily_budget_remaining >= 3.0
             and total_budget_remaining >= 6.0
         ):
-            risk_pct = allocation_config.challenge_max_risk_pct
+            risk_pct = max(
+                risk_pct,
+                allocation_config.challenge_base_risk_pct + 0.35 * edge_quality,
+            )
         elif distance_to_target <= 2.0 and float(account_state.get("account_profitable_days_remaining", 0.0)) <= 0.0:
-            risk_pct = allocation_config.challenge_near_target_risk_pct
+            risk_pct = min(risk_pct, allocation_config.challenge_near_target_risk_pct)
         elif total_budget_remaining <= 2.0 or daily_budget_remaining <= 1.0:
             risk_pct = min(risk_pct, allocation_config.challenge_near_target_risk_pct)
-        return float(risk_pct)
+        return float(np.clip(risk_pct, allocation_config.challenge_min_risk_pct, allocation_config.challenge_max_risk_pct))
 
-    risk_pct = allocation_config.funded_base_risk_pct
+    risk_pct = allocation_config.funded_min_risk_pct + (
+        allocation_config.funded_max_risk_pct - allocation_config.funded_min_risk_pct
+    ) * edge_quality
+    risk_pct *= max(0.25, 1.0 - 0.75 * float(np.clip(funded_breach_risk, 0.0, 1.0)))
     if float(candidate.get("predicted_funded_expected_return_20d", 0.0)) >= 0.20 and drawdown_pct <= 1.5:
-        risk_pct = allocation_config.funded_max_risk_pct
+        risk_pct = max(risk_pct, allocation_config.funded_base_risk_pct)
     if drawdown_pct >= allocation_config.drawdown_soft_pct or total_budget_remaining <= 2.0:
         risk_pct = allocation_config.funded_defensive_risk_pct
-    return float(risk_pct)
+    return float(np.clip(risk_pct, allocation_config.funded_min_risk_pct, allocation_config.funded_max_risk_pct))
 
 
 def load_candidates(path: Path) -> pd.DataFrame:
@@ -542,7 +567,7 @@ def parse_args() -> argparse.Namespace:
     replay.add_argument("--dataset")
     replay.add_argument("--split", default="test")
     replay.add_argument("--starting-balance", type=float, default=100000.0)
-    replay.add_argument("--max-trades-per-day", type=int, default=3)
+    replay.add_argument("--max-trades-per-day", type=int, default=2)
     replay.add_argument("--risk-per-trade-pct", type=float, default=0.25)
     replay.add_argument("--account-stage", choices=["challenge", "funded"], default="challenge")
     replay.add_argument("--min-trade-score", type=float, default=0.0)

@@ -12,7 +12,7 @@ class AccountStateConfig:
     min_profitable_days: int = 3
     max_daily_loss_pct: float = 5.0
     max_total_drawdown_pct: float = 10.0
-    max_trades_per_day: int = 3
+    max_trades_per_day: int = 2
     risk_per_trade_pct: float = 0.25
     initial_account_stage: str = "challenge"
 

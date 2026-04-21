@@ -168,6 +168,7 @@ class TrainConfig:
     funded_risk_loss_weight: float = 0.60
     funded_drawdown_loss_weight: float = 0.40
     funded_payout_loss_weight: float = 0.45
+    frontier_score_loss_weight: float = 0.50
     ranking_loss_weight: float = 0.15
 
 
@@ -178,6 +179,7 @@ class SequenceDataset(Dataset):
         account_features: np.ndarray,
         setup_targets: np.ndarray,
         utility_targets: np.ndarray,
+        stage_codes: np.ndarray,
         end_indices: np.ndarray,
         lookback: int,
     ):
@@ -185,6 +187,7 @@ class SequenceDataset(Dataset):
         self.account_features = torch.from_numpy(np.ascontiguousarray(account_features.astype(np.float32)))
         self.setup_targets = torch.from_numpy(np.ascontiguousarray(setup_targets.astype(np.float32)))
         self.utility_targets = torch.from_numpy(np.ascontiguousarray(utility_targets.astype(np.float32)))
+        self.stage_codes = torch.from_numpy(np.ascontiguousarray(stage_codes.astype(np.float32)))
         self.end_indices = np.ascontiguousarray(end_indices.astype(np.int64))
         self.lookback = int(lookback)
 
@@ -199,6 +202,7 @@ class SequenceDataset(Dataset):
             self.account_features[end_idx],
             self.setup_targets[end_idx],
             self.utility_targets[end_idx],
+            self.stage_codes[end_idx],
             end_idx,
         )
 
@@ -435,11 +439,13 @@ def cap_indices(indices: np.ndarray, max_samples: int, seed: int, randomize: boo
 def make_dataset(frame: pd.DataFrame, market_features: np.ndarray, account_features: np.ndarray, indices: np.ndarray, lookback: int) -> SequenceDataset:
     setup_targets = frame[LABEL_COLUMNS].fillna(0.0).to_numpy(np.float32)
     utility_targets = frame[UTILITY_TARGET_COLUMNS].fillna(0.0).to_numpy(np.float32)
+    stage_codes = frame["account_stage_code"].fillna(0.0).to_numpy(np.float32)
     return SequenceDataset(
         market_features=market_features,
         account_features=account_features,
         setup_targets=setup_targets,
         utility_targets=utility_targets,
+        stage_codes=stage_codes,
         end_indices=indices,
         lookback=lookback,
     )
@@ -455,6 +461,62 @@ def pairwise_ranking_loss(predictions: torch.Tensor, targets: torch.Tensor) -> t
         return predictions.new_tensor(0.0)
     desired = torch.sign(diff_target[mask])
     return torch.mean(torch.relu(0.05 - desired * diff_pred[mask]))
+
+
+def _challenge_score_from_outputs_tensor(utility_outputs: torch.Tensor) -> torch.Tensor:
+    return (
+        1.10 * utility_outputs[:, 0]
+        + 1.40 * utility_outputs[:, 1]
+        + 1.00 * utility_outputs[:, 2]
+        + 0.60 * utility_outputs[:, 3]
+        - 1.20 * utility_outputs[:, 4]
+        - 0.80 * utility_outputs[:, 5]
+        - 0.08 * utility_outputs[:, 6]
+        + 0.25 * utility_outputs[:, 7]
+        - 0.08 * utility_outputs[:, 8]
+        - 0.05 * utility_outputs[:, 9]
+    )
+
+
+def _funded_score_from_outputs_tensor(utility_outputs: torch.Tensor) -> torch.Tensor:
+    return (
+        0.50 * utility_outputs[:, 0]
+        + 0.80 * utility_outputs[:, 10]
+        + 1.20 * utility_outputs[:, 11]
+        - 0.90 * utility_outputs[:, 12]
+        - 1.25 * utility_outputs[:, 13]
+        - 0.60 * utility_outputs[:, 14]
+        + 0.90 * utility_outputs[:, 15]
+    )
+
+
+def _stage_frontier_scores_tensor(utility_outputs: torch.Tensor, stage_codes: torch.Tensor) -> torch.Tensor:
+    challenge_scores = _challenge_score_from_outputs_tensor(utility_outputs)
+    funded_scores = _funded_score_from_outputs_tensor(utility_outputs)
+    funded_mask = stage_codes >= 0.5
+    return torch.where(funded_mask, funded_scores, challenge_scores)
+
+
+def compute_frontier_target_stats(utility_targets: np.ndarray, stage_codes: np.ndarray) -> Dict[str, float]:
+    utility_tensor = torch.from_numpy(np.ascontiguousarray(utility_targets.astype(np.float32)))
+    stage_tensor = torch.from_numpy(np.ascontiguousarray(stage_codes.astype(np.float32)))
+    scores = _stage_frontier_scores_tensor(utility_tensor, stage_tensor).numpy()
+    mean = float(np.mean(scores))
+    std = float(np.std(scores))
+    if not np.isfinite(std) or std <= 1e-6:
+        std = 1.0
+    return {
+        "mean": mean,
+        "std": std,
+    }
+
+
+def normalize_frontier_score_tensor(scores: torch.Tensor, frontier_stats: Dict[str, float]) -> torch.Tensor:
+    return (scores - float(frontier_stats["mean"])) / max(float(frontier_stats["std"]), 1e-6)
+
+
+def normalize_frontier_score_array(scores: np.ndarray, frontier_stats: Dict[str, float]) -> np.ndarray:
+    return (scores - float(frontier_stats["mean"])) / max(float(frontier_stats["std"]), 1e-6)
 
 
 def mean_average_precision(labels: np.ndarray, probs: np.ndarray) -> float:
@@ -475,18 +537,27 @@ def mean_roc_auc(labels: np.ndarray, probs: np.ndarray) -> float:
     return float(np.mean(scores)) if scores else 0.0
 
 
-def train_epoch(model: FrontierUtilityModel, loader: DataLoader, optimizer: torch.optim.Optimizer, pos_weight: torch.Tensor, config: TrainConfig, device: torch.device) -> Dict[str, float]:
+def train_epoch(
+    model: FrontierUtilityModel,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    pos_weight: torch.Tensor,
+    config: TrainConfig,
+    device: torch.device,
+    frontier_stats: Dict[str, float],
+) -> Dict[str, float]:
     model.train()
     total_loss = 0.0
     all_probs = []
     all_labels = []
     bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     huber = nn.HuberLoss()
-    for market_features, account_features, setup_targets, utility_targets, _ in loader:
+    for market_features, account_features, setup_targets, utility_targets, stage_codes, _ in loader:
         market_features = market_features.to(device)
         account_features = account_features.to(device)
         setup_targets = setup_targets.to(device)
         utility_targets = utility_targets.to(device)
+        stage_codes = stage_codes.to(device)
         outputs = model(market_features, account_features)
         setup_loss = bce(outputs["setup_logits"], setup_targets)
         utility_loss = huber(outputs["utility_outputs"][:, 0], utility_targets[:, 0])
@@ -499,7 +570,16 @@ def train_epoch(model: FrontierUtilityModel, loader: DataLoader, optimizer: torc
         funded_risk_loss = huber(outputs["utility_outputs"][:, 12:14], utility_targets[:, 12:14])
         funded_drawdown_loss = huber(outputs["utility_outputs"][:, 14], utility_targets[:, 14])
         funded_payout_loss = huber(outputs["utility_outputs"][:, 15], utility_targets[:, 15])
-        ranking_loss = pairwise_ranking_loss(outputs["utility_outputs"][:, 0], utility_targets[:, 0])
+        predicted_frontier_score = normalize_frontier_score_tensor(
+            _stage_frontier_scores_tensor(outputs["utility_outputs"], stage_codes),
+            frontier_stats,
+        )
+        target_frontier_score = normalize_frontier_score_tensor(
+            _stage_frontier_scores_tensor(utility_targets, stage_codes),
+            frontier_stats,
+        )
+        frontier_score_loss = huber(predicted_frontier_score, target_frontier_score)
+        ranking_loss = pairwise_ranking_loss(predicted_frontier_score, target_frontier_score)
         loss = (
             config.setup_loss_weight * setup_loss
             + config.utility_loss_weight * utility_loss
@@ -512,6 +592,7 @@ def train_epoch(model: FrontierUtilityModel, loader: DataLoader, optimizer: torc
             + config.funded_risk_loss_weight * funded_risk_loss
             + config.funded_drawdown_loss_weight * funded_drawdown_loss
             + config.funded_payout_loss_weight * funded_payout_loss
+            + config.frontier_score_loss_weight * frontier_score_loss
             + config.ranking_loss_weight * ranking_loss
         )
         optimizer.zero_grad(set_to_none=True)
@@ -532,15 +613,16 @@ def train_epoch(model: FrontierUtilityModel, loader: DataLoader, optimizer: torc
 @torch.no_grad()
 def predict(model: FrontierUtilityModel, loader: DataLoader, device: torch.device) -> Dict[str, np.ndarray]:
     model.eval()
-    outputs = {"setup_probs": [], "utility_outputs": [], "end_indices": []}
+    outputs = {"setup_probs": [], "utility_outputs": [], "stage_codes": [], "end_indices": []}
     labels = []
     utility_targets = []
-    for market_features, account_features, batch_labels, batch_utility, end_indices in loader:
+    for market_features, account_features, batch_labels, batch_utility, stage_codes, end_indices in loader:
         market_features = market_features.to(device)
         account_features = account_features.to(device)
         pred = model(market_features, account_features)
         outputs["setup_probs"].append(pred["setup_probs"].cpu().numpy())
         outputs["utility_outputs"].append(pred["utility_outputs"].cpu().numpy())
+        outputs["stage_codes"].append(stage_codes.numpy())
         outputs["end_indices"].append(end_indices.numpy())
         labels.append(batch_labels.numpy())
         utility_targets.append(batch_utility.numpy())
@@ -590,45 +672,33 @@ def save_candidates(path: Path, rows: List[Dict[str, object]]) -> None:
 
 
 def _challenge_score_from_outputs(utility_outputs: np.ndarray) -> np.ndarray:
-    return (
-        1.10 * utility_outputs[:, 0]
-        + 1.40 * utility_outputs[:, 1]
-        + 1.00 * utility_outputs[:, 2]
-        + 0.60 * utility_outputs[:, 3]
-        - 1.20 * utility_outputs[:, 4]
-        - 0.80 * utility_outputs[:, 5]
-        - 0.08 * utility_outputs[:, 6]
-        + 0.25 * utility_outputs[:, 7]
-        - 0.08 * utility_outputs[:, 8]
-        - 0.05 * utility_outputs[:, 9]
-    )
+    return _challenge_score_from_outputs_tensor(torch.from_numpy(np.ascontiguousarray(utility_outputs.astype(np.float32)))).numpy()
 
 
 def _funded_score_from_outputs(utility_outputs: np.ndarray) -> np.ndarray:
-    return (
-        0.50 * utility_outputs[:, 0]
-        + 0.80 * utility_outputs[:, 10]
-        + 1.20 * utility_outputs[:, 11]
-        - 0.90 * utility_outputs[:, 12]
-        - 1.25 * utility_outputs[:, 13]
-        - 0.60 * utility_outputs[:, 14]
-        + 0.90 * utility_outputs[:, 15]
-    )
+    return _funded_score_from_outputs_tensor(torch.from_numpy(np.ascontiguousarray(utility_outputs.astype(np.float32)))).numpy()
 
 
-def build_candidate_rows(frame: pd.DataFrame, predictions: Dict[str, np.ndarray], split: str) -> List[Dict[str, object]]:
+def build_candidate_rows(
+    frame: pd.DataFrame,
+    predictions: Dict[str, np.ndarray],
+    split: str,
+    frontier_stats: Dict[str, float],
+) -> List[Dict[str, object]]:
     end_indices = predictions["end_indices"].astype(int)
     setup_probs = predictions["setup_probs"]
     utility_outputs = predictions["utility_outputs"]
-    challenge_scores = _challenge_score_from_outputs(utility_outputs)
-    funded_scores = _funded_score_from_outputs(utility_outputs)
+    stage_codes = predictions["stage_codes"].astype(np.float32)
+    challenge_scores_raw = _challenge_score_from_outputs(utility_outputs)
+    funded_scores_raw = _funded_score_from_outputs(utility_outputs)
+    frontier_scores_raw = np.where(stage_codes >= 0.5, funded_scores_raw, challenge_scores_raw)
+    frontier_scores = normalize_frontier_score_array(frontier_scores_raw, frontier_stats)
     rows: List[Dict[str, object]] = []
     for local_idx, frame_idx in enumerate(end_indices):
         row = frame.iloc[int(frame_idx)]
         probs = setup_probs[local_idx]
         best_setup_idx = int(np.argmax(probs))
         account_stage = str(row.get("account_stage", "challenge"))
-        frontier_score = funded_scores[local_idx] if account_stage == "funded" else challenge_scores[local_idx]
         rows.append(
             {
                 "split": split,
@@ -661,7 +731,8 @@ def build_candidate_rows(frame: pd.DataFrame, predictions: Dict[str, np.ndarray]
                 "predicted_funded_breach_risk_20d": round(float(utility_outputs[local_idx, 13]), 6),
                 "predicted_funded_expected_drawdown": round(float(utility_outputs[local_idx, 14]), 6),
                 "predicted_funded_expected_payout_growth": round(float(utility_outputs[local_idx, 15]), 6),
-                "predicted_frontier_score": round(float(frontier_score), 6),
+                "predicted_frontier_score_raw": round(float(frontier_scores_raw[local_idx]), 6),
+                "predicted_frontier_score": round(float(frontier_scores[local_idx]), 6),
                 "utility_best_setup": row.get("utility_best_setup", "none"),
                 "trade_challenge_utility": round(float(row["trade_challenge_utility"]), 6),
                 "trade_realized_pnl_r": round(float(row["trade_realized_pnl_r"]), 6),
@@ -706,6 +777,10 @@ def run_train(args: argparse.Namespace) -> int:
     train_dataset = make_dataset(frame, market_features, account_features, train_indices, config.lookback)
     val_dataset = make_dataset(frame, market_features, account_features, val_indices, config.lookback)
     test_dataset = make_dataset(frame, market_features, account_features, test_indices, config.lookback)
+    frontier_stats = compute_frontier_target_stats(
+        frame.loc[train_indices, UTILITY_TARGET_COLUMNS].fillna(0.0).to_numpy(np.float32),
+        frame.loc[train_indices, "account_stage_code"].fillna(0.0).to_numpy(np.float32),
+    )
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, drop_last=False)
     eval_loader_kwargs = {"batch_size": config.batch_size, "shuffle": False, "drop_last": False}
     val_loader = DataLoader(val_dataset, **eval_loader_kwargs)
@@ -721,7 +796,7 @@ def run_train(args: argparse.Namespace) -> int:
     best_state = None
     best_val_score = -float("inf")
     for epoch in range(1, config.epochs + 1):
-        train_metrics = train_epoch(model, train_loader, optimizer, pos_weight, config, device)
+        train_metrics = train_epoch(model, train_loader, optimizer, pos_weight, config, device, frontier_stats)
         val_predictions = predict(model, val_loader, device)
         val_metrics = summarize_predictions(val_predictions)
         history.append(
@@ -754,6 +829,7 @@ def run_train(args: argparse.Namespace) -> int:
             "utility_target_columns": UTILITY_TARGET_COLUMNS,
             "label_columns": LABEL_COLUMNS,
             "standardization": standardization,
+            "frontier_score_stats": frontier_stats,
         },
         artifacts_dir / "model.pt",
     )
@@ -768,6 +844,7 @@ def run_train(args: argparse.Namespace) -> int:
         },
         "dataset_rows": int(len(frame)),
         "sequence_rows": {"train": int(len(train_indices)), "val": int(len(val_indices)), "test": int(len(test_indices))},
+        "frontier_score_stats": frontier_stats,
         "history": history,
         "val_metrics": val_metrics,
         "test_metrics": test_metrics,
@@ -794,6 +871,7 @@ def run_score(args: argparse.Namespace) -> int:
     artifacts_dir = Path(args.artifacts_dir).resolve()
     checkpoint = torch.load(artifacts_dir / "model.pt", map_location="cpu")
     config = TrainConfig(**checkpoint["train_config"])
+    frontier_stats = checkpoint.get("frontier_score_stats", {"mean": 0.0, "std": 1.0})
     frame = load_dataset(dataset_path)
     masks = build_masks(frame, config.train_fraction, config.val_fraction)
     market_features, account_features, _ = fill_and_standardize(frame, masks["train"])
@@ -806,7 +884,7 @@ def run_score(args: argparse.Namespace) -> int:
     model = FrontierUtilityModel(len(MARKET_FEATURE_COLUMNS), len(ACCOUNT_COLUMNS), config).to(device)
     model.load_state_dict(checkpoint["state_dict"])
     predictions = predict(model, loader, device)
-    candidates = build_candidate_rows(frame, predictions, args.split)
+    candidates = build_candidate_rows(frame, predictions, args.split, frontier_stats)
     output_path = Path(args.output)
     save_candidates(output_path, candidates)
     candidate_frame = pd.DataFrame(candidates)
@@ -821,6 +899,12 @@ def run_score(args: argparse.Namespace) -> int:
             "median": round(float(candidate_frame["predicted_frontier_score"].median()), 6) if len(candidate_frame) else 0.0,
             "positive_rate": round(float((candidate_frame["predicted_frontier_score"] > 0.0).mean()), 6) if len(candidate_frame) else 0.0,
         },
+        "frontier_score_raw_summary": {
+            "mean": round(float(candidate_frame["predicted_frontier_score_raw"].mean()), 6) if len(candidate_frame) else 0.0,
+            "median": round(float(candidate_frame["predicted_frontier_score_raw"].median()), 6) if len(candidate_frame) else 0.0,
+            "positive_rate": round(float((candidate_frame["predicted_frontier_score_raw"] > 0.0).mean()), 6) if len(candidate_frame) else 0.0,
+        },
+        "frontier_score_stats": frontier_stats,
         "account_stage_counts": candidate_frame["account_stage"].value_counts(dropna=False).to_dict() if len(candidate_frame) else {},
     }
     if args.analysis_output:

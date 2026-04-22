@@ -1,0 +1,34 @@
+CAPITAL_API_KEY=sWM7XrBVM42ct3Gw
+CAPITAL_IDENTIFIER=khoualdiyassin26@gmail.com
+CAPITAL_PASSWORD=Yacine03041973@
+CAPITAL_BASE_URL=https://demo-api-capital.backend-capital.com
+
+# Trading instrument configuration.
+# Single-instrument mode can use CAPITAL_EPIC / CAPITAL_DATASET / CAPITAL_ARTIFACTS_DIR.
+# Multi-instrument mode should set CAPITAL_INSTRUMENTS and the per-instrument values below.
+CAPITAL_INSTRUMENTS=US100,US500
+CAPITAL_EPIC_US100=US100
+CAPITAL_EPIC_US500=US500
+CAPITAL_DATASET_US100=artifacts/live_snapshots/us100_live_snapshot.csv.gz
+CAPITAL_DATASET_US500=artifacts/live_snapshots/us500_live_snapshot.csv.gz
+CAPITAL_ARTIFACTS_DIR_US100=artifacts/frontier_utility/us100_session_refined_rerun_20260415_regime_workbench_300k
+CAPITAL_ARTIFACTS_DIR_US500=artifacts/frontier_utility/us100_session_refined_rerun_20260415_regime_workbench_300k
+CAPITAL_POINT_VALUE_US100=1.0
+CAPITAL_MIN_SIZE_US100=0.001
+CAPITAL_SIZE_STEP_US100=0.001
+CAPITAL_POINT_VALUE_US500=1.0
+CAPITAL_MIN_SIZE_US500=0.01
+CAPITAL_SIZE_STEP_US500=0.01
+
+# Generic fallback settings.
+CAPITAL_EPIC=US100
+CAPITAL_POINT_VALUE=1.0
+CAPITAL_MIN_SIZE=1.0
+CAPITAL_SIZE_STEP=1.0
+
+# Frontier live policy defaults.
+CAPITAL_STOP_ATR_MULTIPLE=0.75
+CAPITAL_TARGET_ATR_MULTIPLE=1.25
+CAPITAL_MAX_POSITIONS_PER_EPIC=1
+CAPITAL_MIN_FRONTIER_SCORE=0.0
+CAPITAL_LOG_DIR=artifacts/live_capital

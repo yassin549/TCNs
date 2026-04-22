@@ -17,7 +17,12 @@ import torch
 
 from frontier_account_state import AccountStateConfig
 from frontier_allocator import AllocationConfig
+from frontier_execution import ContractSpec, ExecutionPolicy, build_order_plan as build_shared_order_plan
 from frontier_replay import _stage_risk_pct
+from live_config_validation import raise_for_invalid_contracts
+from paper_execution import append_open_position, build_paper_summary, load_paper_state, save_paper_state, sync_paper_positions
+from portfolio_allocator import PortfolioConstraints, allocate_portfolio
+from snapshot_updater import SnapshotUpdateResult, SnapshotUpdaterConfig, update_snapshot
 from frontier_utility_model import (
     ACCOUNT_COLUMNS,
     BASE_COLUMNS,
@@ -76,6 +81,19 @@ class ModelBundle:
     frontier_stats: Dict[str, float]
 
 
+@dataclass
+class ScoredInstrument:
+    live_config: InstrumentLiveConfig
+    candidate: Dict[str, object]
+    runtime_state_path: Path
+    runtime_state: Dict[str, object]
+    market_rules: Dict[str, object]
+    market_details: Dict[str, object]
+    snapshot_status: Optional[Dict[str, object]] = None
+    precheck_hold_reason: Optional[str] = None
+    precheck_extra: Optional[Dict[str, object]] = None
+
+
 def _read_env_file(path: Path) -> Dict[str, str]:
     if not path.exists():
         return {}
@@ -104,6 +122,18 @@ def _require_env(name: str, env_map: Dict[str, str]) -> str:
     if value is None or value == "":
         raise ValueError(f"Missing required environment variable: {name}")
     return value
+
+
+def _require_float(value: Optional[str], field_name: str, instrument_id: str) -> float:
+    if value is None or value == "":
+        raise ValueError(f"Missing required {field_name} for instrument {instrument_id}.")
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"Invalid float for {field_name} on {instrument_id}: {value}") from exc
+    if not np.isfinite(parsed) or parsed <= 0.0:
+        raise ValueError(f"{field_name} must be > 0 for instrument {instrument_id}.")
+    return float(parsed)
 
 
 def _round_to_step(value: float, step: float, minimum: float) -> float:
@@ -226,6 +256,12 @@ class CapitalComClient:
         return body
 
     def get_market_details(self, epic: str) -> Dict[str, object]:
+        try:
+            body, _ = self._request("GET", f"/markets/{parse.quote(epic, safe='')}")
+            if body:
+                return dict(body)
+        except Exception:
+            pass
         body, _ = self._request("GET", f"/markets?epics={parse.quote(epic, safe='')}")
         markets = body.get("markets", [])
         if markets:
@@ -238,6 +274,23 @@ class CapitalComClient:
             if market_epic == epic.upper() or market_symbol == epic.upper():
                 return dict(market)
         raise RuntimeError(f"Capital market lookup returned no market details for epic {epic}.")
+
+    def get_historical_prices(
+        self,
+        epic: str,
+        resolution: str = "MINUTE",
+        max_rows: int = 10,
+        from_time: Optional[str] = None,
+        to_time: Optional[str] = None,
+    ) -> Dict[str, object]:
+        query = [("resolution", resolution), ("max", str(int(max_rows)))]
+        if from_time:
+            query.append(("from", from_time))
+        if to_time:
+            query.append(("to", to_time))
+        encoded = parse.urlencode(query)
+        body, _ = self._request("GET", f"/prices/{parse.quote(epic, safe='')}?{encoded}")
+        return body
 
     def place_position(
         self,
@@ -326,17 +379,20 @@ def _load_instrument_configs(args: argparse.Namespace, env_map: Dict[str, str]) 
                 epic=epic,
                 dataset_path=dataset_path,
                 artifacts_dir=artifacts_dir,
-                point_value=float(
-                    point_value_override
-                    or _instrument_env_or_default(env_map, instrument_id, "CAPITAL_POINT_VALUE", "CAPITAL_POINT_VALUE", "1.0")
+                point_value=float(point_value_override) if point_value_override is not None else _require_float(
+                    _instrument_env_or_default(env_map, instrument_id, "CAPITAL_POINT_VALUE", "CAPITAL_POINT_VALUE"),
+                    "point_value",
+                    instrument_id,
                 ),
-                min_size=float(
-                    min_size_override
-                    or _instrument_env_or_default(env_map, instrument_id, "CAPITAL_MIN_SIZE", "CAPITAL_MIN_SIZE", "1.0")
+                min_size=float(min_size_override) if min_size_override is not None else _require_float(
+                    _instrument_env_or_default(env_map, instrument_id, "CAPITAL_MIN_SIZE", "CAPITAL_MIN_SIZE"),
+                    "min_size",
+                    instrument_id,
                 ),
-                size_step=float(
-                    size_step_override
-                    or _instrument_env_or_default(env_map, instrument_id, "CAPITAL_SIZE_STEP", "CAPITAL_SIZE_STEP", "1.0")
+                size_step=float(size_step_override) if size_step_override is not None else _require_float(
+                    _instrument_env_or_default(env_map, instrument_id, "CAPITAL_SIZE_STEP", "CAPITAL_SIZE_STEP"),
+                    "size_step",
+                    instrument_id,
                 ),
                 stop_atr_multiple=float(
                     stop_atr_override
@@ -545,6 +601,7 @@ def score_latest_candidate(
     return {
         "timestamp": str(row["timestamp"]),
         "session_date_utc": str(row["session_date_utc"]),
+        "segment_id": int(row["segment_id"]),
         "close": float(row["close"]),
         "atr_14": float(row["atr_14"]),
         "account_stage": str(account_state.get("account_stage", "challenge")),
@@ -654,6 +711,7 @@ def _safe_float(value: object, default: float = 0.0) -> float:
 
 
 def _extract_market_rules(market_details: Dict[str, object]) -> Dict[str, object]:
+    instrument = market_details.get("instrument", {})
     dealing_rules = market_details.get("dealingRules", {})
     snapshot = market_details.get("snapshot", {})
     market_status = str(snapshot.get("marketStatus") or market_details.get("marketStatus") or "")
@@ -663,7 +721,7 @@ def _extract_market_rules(market_details: Dict[str, object]) -> Dict[str, object
         "snapshot_update_time": snapshot_update_time,
         "bid": _safe_float(snapshot.get("bid", market_details.get("bid")), np.nan),
         "offer": _safe_float(snapshot.get("offer", market_details.get("offer")), np.nan),
-        "min_deal_size": _safe_float(dealing_rules.get("minDealSize", {}).get("value"), _safe_float(market_details.get("lotSize"), 0.0)),
+        "min_deal_size": _safe_float(dealing_rules.get("minDealSize", {}).get("value"), _safe_float(instrument.get("lotSize", market_details.get("lotSize")), 0.0)),
         "min_size_increment": _safe_float(dealing_rules.get("minSizeIncrement", {}).get("value"), _safe_float(market_details.get("tickSize"), 0.0)),
     }
 
@@ -857,23 +915,79 @@ def _hold_result(
     return result
 
 
-def _run_single_instrument(
+def _prepare_scored_instrument(
     args: argparse.Namespace,
     client: CapitalComClient,
-    session: CapitalSession,
     live_config: InstrumentLiveConfig,
     positions: Dict[str, object],
     market_details: Dict[str, object],
-    global_state: Dict[str, object],
     live_account_state: Dict[str, object],
-) -> Dict[str, object]:
-    candidate = score_latest_candidate(
-        dataset_path=live_config.dataset_path,
-        artifacts_dir=live_config.artifacts_dir,
-        live_account_state=live_account_state,
-    )
+) -> ScoredInstrument:
+    snapshot_status: Optional[SnapshotUpdateResult] = None
+    resolved_epic = str(market_details.get("epic", live_config.epic) or live_config.epic)
+    try:
+        snapshot_status = update_snapshot(
+            client,
+            SnapshotUpdaterConfig(
+                instrument_id=live_config.instrument_id,
+                epic=resolved_epic,
+                snapshot_path=live_config.dataset_path,
+                log_dir=live_config.log_dir,
+                stale_after_seconds=min(int(args.stale_data_seconds), 120),
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001
+        runtime_state_path = live_config.log_dir / "state.json"
+        runtime_state = _load_runtime_state(
+            runtime_state_path,
+            default_payload={"current_day": None, "last_signal_timestamp": None},
+        )
+        return ScoredInstrument(
+            live_config=live_config,
+            candidate={
+                "instrument_id": live_config.instrument_id,
+                "epic": live_config.epic,
+                "dataset_path": str(live_config.dataset_path),
+                "timestamp": "",
+            },
+            runtime_state_path=runtime_state_path,
+            runtime_state=runtime_state,
+            market_rules={},
+            market_details=market_details,
+            snapshot_status={"error": str(exc)},
+            precheck_hold_reason="snapshot_update_failed",
+            precheck_extra={"error": str(exc)},
+        )
+    try:
+        candidate = score_latest_candidate(
+            dataset_path=live_config.dataset_path,
+            artifacts_dir=live_config.artifacts_dir,
+            live_account_state=live_account_state,
+        )
+    except Exception as exc:  # noqa: BLE001
+        runtime_state_path = live_config.log_dir / "state.json"
+        runtime_state = _load_runtime_state(
+            runtime_state_path,
+            default_payload={"current_day": None, "last_signal_timestamp": None},
+        )
+        return ScoredInstrument(
+            live_config=live_config,
+            candidate={
+                "instrument_id": live_config.instrument_id,
+                "epic": live_config.epic,
+                "dataset_path": str(live_config.dataset_path),
+                "timestamp": "",
+            },
+            runtime_state_path=runtime_state_path,
+            runtime_state=runtime_state,
+            market_rules={},
+            market_details=market_details,
+            snapshot_status=asdict(snapshot_status) if snapshot_status else None,
+            precheck_hold_reason="candidate_scoring_failed",
+            precheck_extra={"error": str(exc)},
+        )
     candidate["instrument_id"] = live_config.instrument_id
-    candidate["epic"] = live_config.epic
+    candidate["epic"] = resolved_epic
     candidate["dataset_path"] = str(live_config.dataset_path)
     runtime_state_path = live_config.log_dir / "state.json"
     runtime_state = _load_runtime_state(
@@ -894,50 +1008,108 @@ def _run_single_instrument(
     candidate["broker_snapshot_update_time"] = market_rules["snapshot_update_time"]
 
     if runtime_state.get("last_signal_timestamp") == candidate["timestamp"]:
-        return _hold_result(live_config, "latest_signal_already_processed", candidate)
+        return ScoredInstrument(
+            live_config=live_config,
+            candidate=candidate,
+            runtime_state_path=runtime_state_path,
+            runtime_state=runtime_state,
+            market_rules=market_rules,
+            market_details=market_details,
+            snapshot_status=asdict(snapshot_status) if snapshot_status else None,
+            precheck_hold_reason="latest_signal_already_processed",
+        )
 
     if candidate_age_seconds > float(args.stale_data_seconds):
-        return _hold_result(
-            live_config,
-            "stale_live_dataset",
-            candidate,
-            extra={"stale_data_seconds": args.stale_data_seconds},
+        return ScoredInstrument(
+            live_config=live_config,
+            candidate=candidate,
+            runtime_state_path=runtime_state_path,
+            runtime_state=runtime_state,
+            market_rules=market_rules,
+            market_details=market_details,
+            snapshot_status=asdict(snapshot_status) if snapshot_status else None,
+            precheck_hold_reason="stale_live_dataset",
+            precheck_extra={
+                "stale_data_seconds": args.stale_data_seconds,
+                "snapshot_status": asdict(snapshot_status) if snapshot_status else None,
+            },
         )
 
     if str(market_rules["market_status"]).upper() != "TRADEABLE":
-        return _hold_result(
-            live_config,
-            "market_not_tradeable",
-            candidate,
-            extra={"market_status": market_rules["market_status"]},
+        return ScoredInstrument(
+            live_config=live_config,
+            candidate=candidate,
+            runtime_state_path=runtime_state_path,
+            runtime_state=runtime_state,
+            market_rules=market_rules,
+            market_details=market_details,
+            snapshot_status=asdict(snapshot_status) if snapshot_status else None,
+            precheck_hold_reason="market_not_tradeable",
+            precheck_extra={"market_status": market_rules["market_status"]},
         )
 
     if float(candidate["predicted_frontier_score"]) < live_config.min_frontier_score:
-        runtime_state["last_signal_timestamp"] = candidate["timestamp"]
-        _save_runtime_state(runtime_state_path, runtime_state)
-        return _hold_result(
-            live_config,
-            "frontier_score_below_threshold",
-            candidate,
-            extra={"threshold": live_config.min_frontier_score},
+        return ScoredInstrument(
+            live_config=live_config,
+            candidate=candidate,
+            runtime_state_path=runtime_state_path,
+            runtime_state=runtime_state,
+            market_rules=market_rules,
+            market_details=market_details,
+            snapshot_status=asdict(snapshot_status) if snapshot_status else None,
+            precheck_hold_reason="frontier_score_below_threshold",
+            precheck_extra={"threshold": live_config.min_frontier_score},
         )
 
     open_positions_for_epic = _count_open_positions_for_epic(positions, live_config.epic)
     if open_positions_for_epic >= live_config.max_positions_per_epic:
-        runtime_state["last_signal_timestamp"] = candidate["timestamp"]
-        _save_runtime_state(runtime_state_path, runtime_state)
-        return _hold_result(
-            live_config,
-            "open_position_limit_reached",
-            candidate,
-            extra={"open_positions_for_epic": open_positions_for_epic},
+        return ScoredInstrument(
+            live_config=live_config,
+            candidate=candidate,
+            runtime_state_path=runtime_state_path,
+            runtime_state=runtime_state,
+            market_rules=market_rules,
+            market_details=market_details,
+            snapshot_status=asdict(snapshot_status) if snapshot_status else None,
+            precheck_hold_reason="open_position_limit_reached",
+            precheck_extra={"open_positions_for_epic": open_positions_for_epic},
         )
+    return ScoredInstrument(
+        live_config=live_config,
+        candidate=candidate,
+        runtime_state_path=runtime_state_path,
+        runtime_state=runtime_state,
+        market_rules=market_rules,
+        market_details=market_details,
+        snapshot_status=asdict(snapshot_status) if snapshot_status else None,
+    )
 
-    if int(global_state.get("trades_taken_today", 0)) >= int(args.max_trades_per_day):
-        runtime_state["last_signal_timestamp"] = candidate["timestamp"]
-        _save_runtime_state(runtime_state_path, runtime_state)
-        return _hold_result(live_config, "local_daily_trade_cap_reached", candidate)
 
+def _mark_processed_signal(scored: ScoredInstrument) -> None:
+    scored.runtime_state["last_signal_timestamp"] = scored.candidate["timestamp"]
+    _save_runtime_state(scored.runtime_state_path, scored.runtime_state)
+
+
+def _result_from_precheck_hold(scored: ScoredInstrument) -> Dict[str, object]:
+    result = _hold_result(
+        scored.live_config,
+        str(scored.precheck_hold_reason),
+        scored.candidate,
+        extra=scored.precheck_extra,
+    )
+    result["snapshot_status"] = scored.snapshot_status
+    return result
+
+
+def _run_accepted_instrument(
+    args: argparse.Namespace,
+    client: CapitalComClient,
+    session: CapitalSession,
+    scored: ScoredInstrument,
+    global_state: Dict[str, object],
+    paper_state: Dict[str, object],
+) -> Dict[str, object]:
+    candidate = scored.candidate
     account_config = AccountStateConfig(
         starting_balance=float(global_state.get("prop_starting_balance", session.account_balance)),
         profit_target_pct=float(args.profit_target_pct),
@@ -949,23 +1121,44 @@ def _run_single_instrument(
         initial_account_stage=str(candidate["account_stage"]),
     )
     allocation_config = AllocationConfig(max_trades_per_day=int(args.max_trades_per_day))
-    order_plan = _build_order_plan(candidate, session, live_config, allocation_config, account_config, market_rules)
+    risk_pct = _stage_risk_pct(candidate, candidate["account_state"], account_config, allocation_config)
+    order_plan = build_shared_order_plan(
+        candidate,
+        contract=ContractSpec(
+            instrument_id=scored.live_config.instrument_id,
+            point_value=scored.live_config.point_value,
+            min_size=scored.live_config.min_size,
+            size_step=scored.live_config.size_step,
+            max_positions_per_epic=scored.live_config.max_positions_per_epic,
+            stop_atr_multiple=scored.live_config.stop_atr_multiple,
+            target_atr_multiple=scored.live_config.target_atr_multiple,
+        ),
+        account_balance=session.account_balance,
+        risk_pct=risk_pct,
+        market_min_size=_safe_float(scored.market_rules.get("min_deal_size"), 0.0),
+        market_size_step=_safe_float(scored.market_rules.get("min_size_increment"), 0.0),
+    )
     result = {
         "timestamp_utc": _iso_utc_now(),
-        "instrument_id": live_config.instrument_id,
-        "mode": "dry_run" if not args.execute_live else "live",
+        "instrument_id": scored.live_config.instrument_id,
+        "mode": "simulation" if args.simulation_mode and not args.execute_live else ("dry_run" if not args.execute_live else "live"),
         "candidate": candidate,
-        "order_plan": order_plan,
+        "order_plan": {
+            **asdict(order_plan),
+            "epic": scored.live_config.epic,
+            "market_status": str(scored.market_rules.get("market_status", "")),
+        },
         "account": asdict(session),
+        "snapshot_status": scored.snapshot_status,
     }
 
     if args.execute_live:
         placement = client.place_position(
-            epic=order_plan["epic"],
-            direction=order_plan["direction"],
-            size=float(order_plan["size"]),
-            stop_distance=float(order_plan["stop_distance"]),
-            profit_distance=float(order_plan["profit_distance"]),
+            epic=scored.live_config.epic,
+            direction=order_plan.direction,
+            size=float(order_plan.size),
+            stop_distance=float(order_plan.stop_distance),
+            profit_distance=float(order_plan.target_distance),
         )
         result["placement"] = placement
         deal_reference = str(placement.get("dealReference", ""))
@@ -975,11 +1168,20 @@ def _run_single_instrument(
             except Exception as exc:  # noqa: BLE001
                 result["confirmation_error"] = str(exc)
         global_state["trades_taken_today"] = int(global_state.get("trades_taken_today", 0)) + 1
-        _append_trade_txt_log(live_config.log_dir / "trade_entries.txt", result)
+        _append_trade_txt_log(scored.live_config.log_dir / "trade_entries.txt", result)
+    elif args.simulation_mode:
+        append_open_position(
+            paper_state,
+            instrument_id=scored.live_config.instrument_id,
+            dataset_path=str(scored.live_config.dataset_path),
+            segment_id=int(candidate["segment_id"]),
+            order_plan=result["order_plan"],
+            candidate=candidate,
+        )
+        global_state["trades_taken_today"] = int(global_state.get("trades_taken_today", 0)) + 1
 
-    runtime_state["last_signal_timestamp"] = candidate["timestamp"]
-    _save_runtime_state(runtime_state_path, runtime_state)
-    _append_jsonl(live_config.log_dir / "live_decisions.jsonl", result)
+    _mark_processed_signal(scored)
+    _append_jsonl(scored.live_config.log_dir / "live_decisions.jsonl", result)
     return result
 
 
@@ -988,9 +1190,64 @@ def _build_metrics_snapshot(
     global_state: Dict[str, object],
     live_account_state: Dict[str, object],
     positions: Dict[str, object],
+    paper_state: Dict[str, object],
     results: List[Dict[str, object]],
 ) -> Dict[str, object]:
     open_positions = positions.get("positions", [])
+    open_positions_by_epic: Dict[str, int] = {}
+    mode_counts: Dict[str, int] = {}
+    reason_counts: Dict[str, int] = {}
+    setup_counts: Dict[str, int] = {}
+    manager_bottlenecks: Dict[str, int] = {}
+    snapshot_status_by_instrument: Dict[str, object] = {}
+    instrument_status: Dict[str, Dict[str, object]] = {}
+    for item in open_positions:
+        epic = str(item.get("market", {}).get("epic", ""))
+        open_positions_by_epic[epic] = open_positions_by_epic.get(epic, 0) + 1
+    for result in results:
+        mode = str(result.get("mode", "unknown"))
+        mode_counts[mode] = mode_counts.get(mode, 0) + 1
+        reason = str(result.get("reason", "accepted"))
+        reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        if reason.startswith("rejected_by_allocator") or reason.startswith("rejected_by_portfolio"):
+            manager_bottlenecks["allocator"] = manager_bottlenecks.get("allocator", 0) + 1
+        elif reason in {"frontier_score_below_threshold", "local_daily_trade_cap_reached"}:
+            manager_bottlenecks["manager_policy"] = manager_bottlenecks.get("manager_policy", 0) + 1
+        elif reason in {"market_not_tradeable", "open_position_limit_reached"}:
+            manager_bottlenecks["broker_guard"] = manager_bottlenecks.get("broker_guard", 0) + 1
+        elif reason in {"snapshot_update_failed", "candidate_scoring_failed", "stale_live_dataset"}:
+            manager_bottlenecks["data_or_model"] = manager_bottlenecks.get("data_or_model", 0) + 1
+        else:
+            manager_bottlenecks["other"] = manager_bottlenecks.get("other", 0) + 1
+        candidate = result.get("candidate", {})
+        setup = str(candidate.get("chosen_setup", ""))
+        if setup:
+            setup_counts[setup] = setup_counts.get(setup, 0) + 1
+        instrument_id = str(result.get("instrument_id", ""))
+        if instrument_id:
+            snapshot = result.get("snapshot_status", {})
+            snapshot_status_by_instrument[instrument_id] = snapshot
+            instrument_status[instrument_id] = {
+                "mode": result.get("mode", ""),
+                "reason": result.get("reason", "accepted"),
+                "setup": setup,
+                "frontier_score": round(float(candidate.get("predicted_frontier_score", 0.0)), 6) if candidate else None,
+                "frontier_score_raw": round(float(candidate.get("predicted_frontier_score_raw", 0.0)), 6) if candidate else None,
+                "probability": round(float(candidate.get("probability", 0.0)), 6) if candidate else None,
+                "signal_age_seconds": round(float(candidate.get("signal_age_seconds", 0.0)), 3) if candidate else None,
+                "market_status": candidate.get("market_status"),
+                "signal_timestamp": candidate.get("timestamp"),
+                "broker_bid": candidate.get("broker_bid"),
+                "broker_offer": candidate.get("broker_offer"),
+                "allocator_decision": candidate.get("allocator_decision"),
+                "applied_risk_pct": candidate.get("applied_risk_pct"),
+                "size": result.get("order_plan", {}).get("size"),
+                "snapshot_latest_timestamp_utc": snapshot.get("latest_timestamp_utc") if isinstance(snapshot, dict) else None,
+                "snapshot_latest_age_seconds": snapshot.get("latest_age_seconds") if isinstance(snapshot, dict) else None,
+                "snapshot_rows_appended": snapshot.get("rows_appended") if isinstance(snapshot, dict) else None,
+                "snapshot_missing_alert_count": len(snapshot.get("missing_data_alerts", [])) if isinstance(snapshot, dict) else None,
+            }
+    paper_summary = build_paper_summary(paper_state)
     return {
         "timestamp_utc": _iso_utc_now(),
         "account_id": session.current_account_id,
@@ -1000,10 +1257,22 @@ def _build_metrics_snapshot(
         "account_stage": live_account_state["account_stage"],
         "account_return_pct_to_date": live_account_state["account_return_pct_to_date"],
         "account_drawdown_pct": live_account_state["account_drawdown_pct"],
+        "day_pnl_pct_so_far": live_account_state["day_pnl_pct_so_far"],
+        "day_loss_budget_remaining_pct": live_account_state["day_loss_budget_remaining_pct"],
+        "total_drawdown_budget_remaining_pct": live_account_state["total_drawdown_budget_remaining_pct"],
+        "trade_slots_remaining_today": live_account_state["trade_slots_remaining_today"],
         "profitable_days": live_account_state["realized_profitable_days"],
         "losing_days": live_account_state["realized_losing_days"],
         "trades_taken_today": live_account_state["trades_taken_today"],
         "open_positions_total": len(open_positions),
+        "open_positions_by_epic": open_positions_by_epic,
+        "mode_counts": mode_counts,
+        "reason_counts": reason_counts,
+        "manager_bottlenecks": manager_bottlenecks,
+        "setup_counts": setup_counts,
+        "instrument_status": instrument_status,
+        "snapshot_status_by_instrument": snapshot_status_by_instrument,
+        "paper_summary": paper_summary,
         "results": results,
     }
 
@@ -1011,34 +1280,67 @@ def _build_metrics_snapshot(
 def _print_metrics(snapshot: Dict[str, object]) -> None:
     print(
         "[{ts}] balance={bal:.2f} {ccy} stage={stage} return={ret:.4f}% drawdown={dd:.4f}% "
-        "profitable_days={pd} losing_days={ld} trades_today={tt} open_positions={op}".format(
+        "day_pnl={day_pnl:.4f}% day_budget_left={day_budget:.4f}% dd_budget_left={dd_budget:.4f}% "
+        "profitable_days={pd} losing_days={ld} trades_today={tt} slots_left={slots} open_positions={op} "
+        "modes={modes} bottlenecks={bottlenecks} setups={setups} paper_active={paper_active} paper_closed={paper_closed} "
+        "paper_roll_pnl_r={paper_pnl_r:.4f}".format(
             ts=snapshot["timestamp_utc"],
             bal=float(snapshot["account_balance"]),
             ccy=snapshot["currency"],
             stage=snapshot["account_stage"],
             ret=float(snapshot["account_return_pct_to_date"]),
             dd=float(snapshot["account_drawdown_pct"]),
+            day_pnl=float(snapshot.get("day_pnl_pct_so_far", 0.0)),
+            day_budget=float(snapshot.get("day_loss_budget_remaining_pct", 0.0)),
+            dd_budget=float(snapshot.get("total_drawdown_budget_remaining_pct", 0.0)),
             pd=int(snapshot["profitable_days"]),
             ld=int(snapshot["losing_days"]),
             tt=int(snapshot["trades_taken_today"]),
+            slots=int(snapshot.get("trade_slots_remaining_today", 0)),
             op=int(snapshot["open_positions_total"]),
+            modes=json.dumps(snapshot.get("mode_counts", {}), sort_keys=True),
+            bottlenecks=json.dumps(snapshot.get("manager_bottlenecks", {}), sort_keys=True),
+            setups=json.dumps(snapshot.get("setup_counts", {}), sort_keys=True),
+            paper_active=int(snapshot.get("paper_summary", {}).get("active_trades", 0)),
+            paper_closed=int(snapshot.get("paper_summary", {}).get("closed_trades", 0)),
+            paper_pnl_r=float(snapshot.get("paper_summary", {}).get("rolling_pnl_r", 0.0)),
         )
     )
-    for result in snapshot["results"]:
-        candidate = result.get("candidate", {})
-        order_plan = result.get("order_plan", {})
+    for instrument_id, status in sorted(snapshot.get("instrument_status", {}).items()):
         print(
             "  {instrument} mode={mode} reason={reason} setup={setup} frontier={frontier:.6f} "
-            "prob={prob:.6f} age_sec={age:.0f} size={size} epic={epic}".format(
-                instrument=result.get("instrument_id", ""),
-                mode=result.get("mode", ""),
-                reason=result.get("reason", "accepted"),
-                setup=candidate.get("chosen_setup", ""),
-                frontier=float(candidate.get("predicted_frontier_score", 0.0)),
-                prob=float(candidate.get("probability", 0.0)),
-                age=float(candidate.get("signal_age_seconds", 0.0)),
-                size=order_plan.get("size", "-"),
-                epic=candidate.get("epic", ""),
+            "prob={prob:.6f} age_sec={age:.0f} risk_pct={risk} size={size} market={market} "
+            "snap_age={snap_age} rows+={rows_added} gap_alerts={gap_alerts}".format(
+                instrument=instrument_id,
+                mode=status.get("mode", ""),
+                reason=status.get("reason", "accepted"),
+                setup=status.get("setup", ""),
+                frontier=float(status.get("frontier_score", 0.0)),
+                prob=float(status.get("probability", 0.0)),
+                age=float(status.get("signal_age_seconds", 0.0)),
+                risk=(
+                    f"{float(status.get('applied_risk_pct')):.3f}%"
+                    if status.get("applied_risk_pct") is not None
+                    else "-"
+                ),
+                size=status.get("size", "-"),
+                market=status.get("market_status", "-"),
+                snap_age=(
+                    f"{float(status.get('snapshot_latest_age_seconds')):.0f}s"
+                    if status.get("snapshot_latest_age_seconds") is not None
+                    else "-"
+                ),
+                rows_added=status.get("snapshot_rows_appended", "-"),
+                gap_alerts=status.get("snapshot_missing_alert_count", "-"),
+            )
+        )
+    for setup, perf in sorted(snapshot.get("paper_summary", {}).get("performance", {}).items()):
+        print(
+            "  specialist {setup} trades={trades} rolling_ap={rolling_ap:.4f} rolling_pnl_r={rolling_pnl_r:.4f}".format(
+                setup=setup,
+                trades=int(perf.get("trades", 0)),
+                rolling_ap=float(perf.get("rolling_ap", 0.0)),
+                rolling_pnl_r=float(perf.get("rolling_pnl_r", 0.0)),
             )
         )
 
@@ -1048,31 +1350,134 @@ def _single_cycle(
     client: CapitalComClient,
     instrument_configs: List[InstrumentLiveConfig],
     base_log_dir: Path,
-) -> Tuple[CapitalSession, Dict[str, object], Dict[str, object], List[Dict[str, object]]]:
+) -> Tuple[CapitalSession, Dict[str, object], Dict[str, object], Dict[str, object], List[Dict[str, object]]]:
     session = client.create_session()
     positions = client.list_positions()
     global_state_path = base_log_dir / "_server_state.json"
+    paper_state_path = base_log_dir / "_paper_state.json"
     global_state = _load_runtime_state(global_state_path)
+    paper_state = load_paper_state(paper_state_path)
     if not global_state:
         global_state = _default_global_state(session.account_balance, datetime.now(timezone.utc), args)
     global_state = _roll_global_state_for_balance(global_state, session.account_balance, datetime.now(timezone.utc))
     live_account_state = _account_state_from_global_state(global_state, session, args)
     results: List[Dict[str, object]] = []
+    scored_instruments: List[ScoredInstrument] = []
+    allocation_config = AllocationConfig(max_trades_per_day=int(args.max_trades_per_day))
     for config in instrument_configs:
         market_details = client.get_market_details(config.epic)
-        result = _run_single_instrument(
+        scored = _prepare_scored_instrument(
             args=args,
             client=client,
-            session=session,
             live_config=config,
             positions=positions,
             market_details=market_details,
-            global_state=global_state,
             live_account_state=live_account_state,
         )
-        results.append(result)
+        scored_instruments.append(scored)
+
+    if args.simulation_mode:
+        default_stop_atr = float(instrument_configs[0].stop_atr_multiple) if instrument_configs else 0.75
+        default_target_atr = float(instrument_configs[0].target_atr_multiple) if instrument_configs else 1.25
+        paper_state = sync_paper_positions(
+            paper_state,
+            execution_policy=ExecutionPolicy(
+                stop_atr_multiple=float(args.stop_atr_multiple if args.stop_atr_multiple is not None else default_stop_atr),
+                target_atr_multiple=float(args.target_atr_multiple if args.target_atr_multiple is not None else default_target_atr),
+                breakeven_trigger_r=float(args.breakeven_trigger_r) if args.breakeven_trigger_r > 0.0 else None,
+                max_hold_bars=int(args.max_hold_bars),
+            ),
+        )
+
+    allocatable = [item for item in scored_instruments if item.precheck_hold_reason is None]
+    if int(global_state.get("trades_taken_today", 0)) >= int(args.max_trades_per_day):
+        for scored in allocatable:
+            _mark_processed_signal(scored)
+            hold_result = _hold_result(scored.live_config, "local_daily_trade_cap_reached", scored.candidate)
+            hold_result["snapshot_status"] = scored.snapshot_status
+            results.append(hold_result)
+        allocatable = []
+
+    accepted_by_key: Dict[Tuple[str, str], Dict[str, object]] = {}
+    rejected_by_key: Dict[Tuple[str, str], Dict[str, object]] = {}
+    if allocatable:
+        open_position_context = [
+            {
+                "instrument_id": str(item.get("market", {}).get("epic", "")),
+                "direction": str(item.get("position", {}).get("direction", "")),
+                "risk_pct": 0.0,
+            }
+            for item in positions.get("positions", [])
+        ]
+        accepted_rows, rejected_rows = allocate_portfolio(
+            [item.candidate for item in allocatable],
+            live_account_state,
+            AccountStateConfig(
+                starting_balance=float(global_state.get("prop_starting_balance", session.account_balance)),
+                profit_target_pct=float(args.profit_target_pct),
+                min_profitable_days=int(args.min_profitable_days),
+                max_daily_loss_pct=float(args.max_daily_loss_pct),
+                max_total_drawdown_pct=float(args.max_total_drawdown_pct),
+                max_trades_per_day=int(args.max_trades_per_day),
+                risk_per_trade_pct=float(args.fallback_risk_pct),
+                initial_account_stage=str(live_account_state.get("account_stage", "challenge")),
+            ),
+            allocation_config,
+            PortfolioConstraints(
+                max_concurrent_trades=int(args.max_trades_per_day),
+                max_portfolio_risk_pct=float(args.max_portfolio_risk_pct),
+                max_same_direction_per_correlation_group=int(args.max_same_direction_per_correlation_group),
+            ),
+            current_open_positions=open_position_context,
+            performance_state=build_paper_summary(paper_state).get("performance", {}),
+        )
+        accepted_by_key = {
+            (str(row.get("instrument_id", "")), str(row.get("timestamp", ""))): row
+            for row in accepted_rows
+        }
+        rejected_by_key = {
+            (str(row.get("instrument_id", "")), str(row.get("timestamp", ""))): row
+            for row in rejected_rows
+        }
+
+    for scored in scored_instruments:
+        if scored.precheck_hold_reason is not None:
+            results.append(_result_from_precheck_hold(scored))
+            continue
+        key = (scored.live_config.instrument_id, str(scored.candidate["timestamp"]))
+        if key in accepted_by_key:
+            scored.candidate.update(accepted_by_key[key])
+            results.append(
+                _run_accepted_instrument(
+                    args=args,
+                    client=client,
+                    session=session,
+                    scored=scored,
+                    global_state=global_state,
+                    paper_state=paper_state,
+                )
+            )
+            continue
+        if key in rejected_by_key:
+            scored.candidate.update(rejected_by_key[key])
+            _mark_processed_signal(scored)
+            hold_result = _hold_result(
+                scored.live_config,
+                str(rejected_by_key[key].get("allocator_decision", "rejected_by_allocator")),
+                scored.candidate,
+                extra={"allocator_score": rejected_by_key[key].get("allocator_score")},
+            )
+            hold_result["snapshot_status"] = scored.snapshot_status
+            results.append(hold_result)
+            continue
+        _mark_processed_signal(scored)
+        hold_result = _hold_result(scored.live_config, "allocator_no_decision", scored.candidate)
+        hold_result["snapshot_status"] = scored.snapshot_status
+        results.append(hold_result)
     _save_runtime_state(global_state_path, global_state)
-    return session, global_state, positions, results
+    if args.simulation_mode:
+        save_paper_state(paper_state_path, paper_state)
+    return session, global_state, positions, paper_state, results
 
 
 def _run_once(
@@ -1081,9 +1486,9 @@ def _run_once(
     instrument_configs: List[InstrumentLiveConfig],
     base_log_dir: Path,
 ) -> int:
-    session, global_state, positions, results = _single_cycle(args, client, instrument_configs, base_log_dir)
+    session, global_state, positions, paper_state, results = _single_cycle(args, client, instrument_configs, base_log_dir)
     live_account_state = _account_state_from_global_state(global_state, session, args)
-    metrics = _build_metrics_snapshot(session, global_state, live_account_state, positions, results)
+    metrics = _build_metrics_snapshot(session, global_state, live_account_state, positions, paper_state, results)
     print(json.dumps(results if len(results) > 1 else results[0], indent=2))
     _append_jsonl(base_log_dir / "server_metrics.jsonl", metrics)
     return 0
@@ -1098,9 +1503,9 @@ def _serve_loop(
     loops = 0
     while True:
         loop_started = time.time()
-        session, global_state, positions, results = _single_cycle(args, client, instrument_configs, base_log_dir)
+        session, global_state, positions, paper_state, results = _single_cycle(args, client, instrument_configs, base_log_dir)
         live_account_state = _account_state_from_global_state(global_state, session, args)
-        metrics = _build_metrics_snapshot(session, global_state, live_account_state, positions, results)
+        metrics = _build_metrics_snapshot(session, global_state, live_account_state, positions, paper_state, results)
         _append_jsonl(base_log_dir / "server_metrics.jsonl", metrics)
         _print_metrics(metrics)
         loops += 1
@@ -1115,6 +1520,20 @@ def run_live(args: argparse.Namespace) -> int:
     env_map = _read_env_file(Path(args.env_file).resolve())
     credentials = _load_credentials(env_map)
     instrument_configs, base_log_dir = _load_instrument_configs(args, env_map)
+    raise_for_invalid_contracts(
+        [
+            ContractSpec(
+                instrument_id=config.instrument_id,
+                point_value=config.point_value,
+                min_size=config.min_size,
+                size_step=config.size_step,
+                max_positions_per_epic=config.max_positions_per_epic,
+                stop_atr_multiple=config.stop_atr_multiple,
+                target_atr_multiple=config.target_atr_multiple,
+            )
+            for config in instrument_configs
+        ]
+    )
     client = CapitalComClient(credentials)
     if args.serve:
         return _serve_loop(args, client, instrument_configs, base_log_dir)
@@ -1133,9 +1552,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--size-step", type=float)
     parser.add_argument("--stop-atr-multiple", type=float)
     parser.add_argument("--target-atr-multiple", type=float)
+    parser.add_argument("--breakeven-trigger-r", type=float, default=0.0)
+    parser.add_argument("--max-hold-bars", type=int, default=30)
     parser.add_argument("--max-positions-per-epic", type=int)
     parser.add_argument("--min-frontier-score", type=float)
     parser.add_argument("--max-trades-per-day", type=int, default=2)
+    parser.add_argument("--max-portfolio-risk-pct", type=float, default=1.0)
+    parser.add_argument("--max-same-direction-per-correlation-group", type=int, default=1)
     parser.add_argument("--fallback-risk-pct", type=float, default=0.25)
     parser.add_argument("--starting-balance", type=float, default=0.0)
     parser.add_argument("--profit-target-pct", type=float, default=10.0)
@@ -1143,10 +1566,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-daily-loss-pct", type=float, default=5.0)
     parser.add_argument("--max-total-drawdown-pct", type=float, default=10.0)
     parser.add_argument("--stale-data-seconds", type=int, default=900)
-    parser.add_argument("--serve", action="store_true", help="Run continuously and print terminal metrics each cycle.")
+    parser.add_argument("--serve", "--server", dest="serve", action="store_true", help="Run continuously and print terminal metrics each cycle.")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--max-loops", type=int, default=0)
     parser.add_argument("--log-dir")
+    parser.add_argument("--simulation-mode", action="store_true", help="Record accepted trades into a paper ledger and resolve them from live bars.")
     parser.add_argument("--execute-live", action="store_true", help="Actually place an order. Default is dry-run.")
     return parser.parse_args()
 

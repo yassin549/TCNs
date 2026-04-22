@@ -13,6 +13,8 @@ import pandas as pd
 
 from frontier_account_state import AccountStateConfig, AccountStateTracker
 from frontier_allocator import AllocationConfig, allocate_day, build_policy_payload, determine_kill_switch_state
+from frontier_execution import ContractSpec, ExecutionPolicy, build_order_plan, resolve_trade_on_bars
+from portfolio_allocator import PortfolioConstraints, allocate_portfolio
 from prop_firm_rules import evaluate_propfirm_path, fundedhive_backtest_defaults
 
 
@@ -91,6 +93,18 @@ def load_candidates(path: Path) -> pd.DataFrame:
     frame = pd.read_csv(path, compression="gzip" if str(path).endswith(".gz") else None)
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
     frame["session_date_utc"] = pd.to_datetime(frame["session_date_utc"]).dt.date
+    return frame.sort_values(["timestamp"]).reset_index(drop=True)
+
+
+def load_price_bars(path: Path) -> pd.DataFrame:
+    usecols = ["timestamp", "session_date_utc", "segment_id", "bar_index_in_segment", "open", "high", "low", "close", "atr_14"]
+    frame = pd.read_csv(path, compression="gzip" if str(path).endswith(".gz") else None, usecols=usecols)
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], utc=True)
+    frame["session_date_utc"] = pd.to_datetime(frame["session_date_utc"]).dt.date
+    for column in ["open", "high", "low", "close", "atr_14"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["segment_id"] = pd.to_numeric(frame["segment_id"], errors="raise").astype(int)
+    frame["bar_index_in_segment"] = pd.to_numeric(frame["bar_index_in_segment"], errors="raise").astype(int)
     return frame.sort_values(["timestamp"]).reset_index(drop=True)
 
 
@@ -234,8 +248,11 @@ def _build_challenge_metrics(
 
 def replay_candidates(
     candidates: pd.DataFrame,
+    price_bars: pd.DataFrame,
     account_config: AccountStateConfig,
     allocation_config: AllocationConfig,
+    execution_policy: ExecutionPolicy,
+    portfolio_constraints: PortfolioConstraints,
 ) -> Tuple[List[Dict[str, object]], Dict[str, int], Dict[str, object]]:
     tracker = AccountStateTracker(account_config)
     trade_rows: List[Dict[str, object]] = []
@@ -256,19 +273,52 @@ def replay_candidates(
             row["state_account_profitable_days_remaining"] = start_state["account_profitable_days_remaining"]
             row["state_kill_switch_state"] = determine_kill_switch_state(start_state, allocation_config)
             day_candidates.append(row)
-        accepted, rejected = allocate_day(day_candidates, start_state, allocation_config)
+        accepted, rejected = allocate_portfolio(
+            day_candidates,
+            start_state,
+            account_config,
+            allocation_config,
+            portfolio_constraints,
+        )
         for rejected_row in rejected:
             skip_counts[str(rejected_row["allocator_decision"])] += 1
         for accepted_row in accepted:
             balance_before = tracker.state.balance
-            risk_pct = _stage_risk_pct(accepted_row, start_state, account_config, allocation_config)
-            risk_cash = balance_before * (risk_pct / 100.0)
-            pnl_r = _safe_float(accepted_row.get("trade_realized_pnl_r"))
-            pnl_cash = risk_cash * pnl_r
-            state_after = tracker.apply_trade(session_date, pnl_cash=pnl_cash, pnl_r=pnl_r)
+            risk_pct = _safe_float(
+                accepted_row.get("applied_risk_pct"),
+                _stage_risk_pct(accepted_row, start_state, account_config, allocation_config),
+            )
+            instrument_id = str(accepted_row.get("instrument_id", "BACKTEST"))
+            contract = ContractSpec(
+                instrument_id=instrument_id,
+                point_value=1.0,
+                min_size=1.0,
+                size_step=1.0,
+                stop_atr_multiple=execution_policy.stop_atr_multiple,
+                target_atr_multiple=execution_policy.target_atr_multiple,
+            )
+            order_plan = build_order_plan(
+                accepted_row,
+                contract=contract,
+                account_balance=balance_before,
+                risk_pct=risk_pct,
+            )
+            resolution = resolve_trade_on_bars(
+                bars=price_bars,
+                entry_timestamp=accepted_row["timestamp"],
+                segment_id=int(accepted_row["segment_id"]),
+                plan=order_plan,
+                policy=execution_policy,
+            )
+            state_after = tracker.apply_trade(
+                session_date,
+                pnl_cash=resolution.pnl_cash,
+                pnl_r=resolution.pnl_r,
+            )
             accepted_setups[str(accepted_row["chosen_setup"])] += 1
             trade_rows.append(
                 {
+                    "instrument_id": instrument_id,
                     "setup": accepted_row["chosen_setup"],
                     "account_stage": _account_stage(start_state, account_config),
                     "probability": accepted_row["probability"],
@@ -292,22 +342,26 @@ def replay_candidates(
                     "session_date_utc": session_date,
                     "market_session": accepted_row["market_session"],
                     "session_phase": accepted_row["session_phase"],
-                    "entry_timestamp": accepted_row["timestamp"],
-                    "exit_timestamp": accepted_row["timestamp"],
+                    "entry_timestamp": resolution.entry_timestamp,
+                    "exit_timestamp": resolution.exit_timestamp,
                     "entry_index": int(accepted_row["bar_index_in_segment"]),
-                    "exit_index": int(accepted_row["bar_index_in_segment"]) + 1,
-                    "entry_price": float(accepted_row["close"]),
-                    "exit_price": float(accepted_row["close"]),
-                    "exit_reason": "utility_label",
-                    "bars_held": 1,
+                    "exit_index": int(accepted_row["bar_index_in_segment"]) + int(resolution.bars_held),
+                    "entry_price": resolution.entry_price,
+                    "exit_price": resolution.exit_price,
+                    "exit_reason": resolution.exit_reason,
+                    "bars_held": resolution.bars_held,
                     "allocator_rank_within_day": int(accepted_row.get("allocator_rank_within_day", 0)),
                     "allocator_score": _safe_float(accepted_row.get("allocator_score")),
                     "balance_before": round(balance_before, 2),
                     "balance_after": round(state_after["account_balance"], 2),
-                    "risk_pct": round(risk_pct, 4),
-                    "risk_cash": round(risk_cash, 2),
-                    "pnl_r": round(pnl_r, 6),
-                    "pnl_cash": round(pnl_cash, 2),
+                    "risk_pct": round(resolution.risk_pct, 4),
+                    "risk_cash": round(resolution.risk_cash, 2),
+                    "pnl_r": round(resolution.pnl_r, 6),
+                    "pnl_cash": round(resolution.pnl_cash, 2),
+                    "stop_price": resolution.stop_price,
+                    "target_price": resolution.target_price,
+                    "max_favorable_excursion_r": resolution.max_favorable_excursion_r,
+                    "max_adverse_excursion_r": resolution.max_adverse_excursion_r,
                     "account_drawdown_pct_before_trade": round(float(start_state["account_drawdown_pct"]), 6),
                     "account_distance_to_target_pct_before_trade": round(float(start_state["account_distance_to_target_pct"]), 6),
                     "account_profitable_days_remaining_before_trade": int(start_state["account_profitable_days_remaining"]),
@@ -430,6 +484,7 @@ def build_backtest_summary(trades: pd.DataFrame, skip_counts: Dict[str, int], co
 def save_trades(path: Path, rows: List[Dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = [
+        "instrument_id",
         "setup",
         "account_stage",
         "probability",
@@ -469,6 +524,10 @@ def save_trades(path: Path, rows: List[Dict[str, object]]) -> None:
         "risk_cash",
         "pnl_r",
         "pnl_cash",
+        "stop_price",
+        "target_price",
+        "max_favorable_excursion_r",
+        "max_adverse_excursion_r",
         "account_drawdown_pct_before_trade",
         "account_distance_to_target_pct_before_trade",
         "account_profitable_days_remaining_before_trade",
@@ -483,6 +542,9 @@ def run_replay(args: argparse.Namespace) -> int:
     artifacts_dir = Path(args.artifacts_dir).resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     candidates = load_candidates(candidates_path)
+    if not args.dataset:
+        raise ValueError("Replay requires --dataset so trades can be resolved against actual OHLC bars.")
+    price_bars = load_price_bars(Path(args.dataset).resolve())
     fundedhive = fundedhive_backtest_defaults()
     account_config = AccountStateConfig(
         starting_balance=float(args.starting_balance),
@@ -499,7 +561,25 @@ def run_replay(args: argparse.Namespace) -> int:
         max_trades_per_day=int(args.max_trades_per_day),
         allow_continuation=bool(args.allow_continuation),
     )
-    trade_rows, skip_counts, replay_meta = replay_candidates(candidates, account_config, allocation_config)
+    execution_policy = ExecutionPolicy(
+        stop_atr_multiple=float(args.stop_atr_multiple),
+        target_atr_multiple=float(args.target_atr_multiple),
+        breakeven_trigger_r=float(args.breakeven_trigger_r) if args.breakeven_trigger_r > 0.0 else None,
+        max_hold_bars=int(args.max_hold_bars),
+    )
+    portfolio_constraints = PortfolioConstraints(
+        max_concurrent_trades=int(args.max_concurrent_trades),
+        max_portfolio_risk_pct=float(args.max_portfolio_risk_pct),
+        max_same_direction_per_correlation_group=int(args.max_same_direction_per_correlation_group),
+    )
+    trade_rows, skip_counts, replay_meta = replay_candidates(
+        candidates,
+        price_bars,
+        account_config,
+        allocation_config,
+        execution_policy,
+        portfolio_constraints,
+    )
     trades_frame = pd.DataFrame(trade_rows)
     policy_payload = build_policy_payload(allocation_config)
     policy_payload["backtest_config"] = {
@@ -545,6 +625,8 @@ def run_replay(args: argparse.Namespace) -> int:
         "split": args.split,
         "account_config": asdict(account_config),
         "allocation_config": asdict(allocation_config),
+        "execution_policy": asdict(execution_policy),
+        "portfolio_constraints": asdict(portfolio_constraints),
         "summary": summary_payload["summary"],
         "challenge_metrics": challenge_metrics,
         "rolling_start": challenge_metrics["rolling_start"],
@@ -572,6 +654,13 @@ def parse_args() -> argparse.Namespace:
     replay.add_argument("--account-stage", choices=["challenge", "funded"], default="challenge")
     replay.add_argument("--min-trade-score", type=float, default=0.0)
     replay.add_argument("--allow-continuation", action="store_true")
+    replay.add_argument("--stop-atr-multiple", type=float, default=0.75)
+    replay.add_argument("--target-atr-multiple", type=float, default=1.25)
+    replay.add_argument("--breakeven-trigger-r", type=float, default=0.0)
+    replay.add_argument("--max-hold-bars", type=int, default=30)
+    replay.add_argument("--max-concurrent-trades", type=int, default=2)
+    replay.add_argument("--max-portfolio-risk-pct", type=float, default=1.0)
+    replay.add_argument("--max-same-direction-per-correlation-group", type=int, default=1)
     replay.add_argument("--bootstrap-simulations", type=int, default=500)
     replay.add_argument("--bootstrap-seed", type=int, default=7)
     replay.set_defaults(func=run_replay)
